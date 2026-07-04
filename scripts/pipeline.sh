@@ -11,6 +11,9 @@
 #   --frames N                  期望总帧数（自动分场景/保底）
 #   --scene-threshold F         场景切换阈值（默认 0.4）
 #   --max-frames N              抽帧总数上限（默认 200，超出按时间均匀采样）
+#   --whisper-timeout S         whisper 超时秒数（默认 7200）
+#   --keep-audio                保留 wav（默认转录后清理，节省 80MB）
+#   --force                     强制重跑所有步骤（默认跳过已存在产物，幂等）
 #   --skip-frames               跳过抽帧和视觉理解
 #   --skip-notes                跳过结构化笔记
 #   --skip-feishu               跳过推送到飞书知识库
@@ -69,6 +72,8 @@ ANKI_DECK=""
 VISION_MODEL="llava-phi3"
 TEXT_MODEL="qwen3:8b"
 WHISPER_TIMEOUT=7200       # whisper 转录超时（秒），默认 2h
+KEEP_AUDIO=0                # 默认转录后清理 wav（80MB），加 --keep-audio 保留
+FORCE=0                     # 强制重跑所有步骤（默认跳过已存在产物），加 --force
 FROM_STEP=1
 TO_STEP=9
 
@@ -101,6 +106,8 @@ while [[ $# -gt 0 ]]; do
     --vision-model) VISION_MODEL="$2"; shift 2 ;;
     --text-model) TEXT_MODEL="$2"; shift 2 ;;
     --whisper-timeout) WHISPER_TIMEOUT="$2"; shift 2 ;;
+    --keep-audio) KEEP_AUDIO=1; shift ;;
+    --force) FORCE=1; shift ;;
     --from-step) FROM_STEP="$2"; shift 2 ;;
     --to-step) TO_STEP="$2"; shift 2 ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -150,6 +157,13 @@ if ! [[ "$FROM_STEP" =~ ^[0-9]+$ ]] || ! [[ "$TO_STEP" =~ ^[0-9]+$ ]]; then
   err "--from-step 和 --to-step 必须是数字"
   exit 1
 fi
+
+# 总计时起点（用于 P2-G：每个 step 计时 + 总耗时）
+PIPELINE_START=$(date +%s)
+step_elapsed() {
+  local now=$(date +%s)
+  echo "[+$(($now - PIPELINE_START))s]" >&2
+}
 if [ "$FROM_STEP" -lt 1 ] || [ "$TO_STEP" -gt 9 ] || [ "$FROM_STEP" -gt "$TO_STEP" ]; then
   err "step 范围不合法: --from-step $FROM_STEP --to-step $TO_STEP（有效: 1-9，且 from ≤ to）"
   exit 1
@@ -213,20 +227,36 @@ RUN_STEP_4=0
 # 启动 step 4 后台（不依赖 step 2 输出）
 STEP4_PID=""
 STEP4_LOG=""
+STEP4_SKIP=0
 if [ $RUN_STEP_4 -eq 1 ]; then
   step 4 "抽关键帧（后台）"
   mkdir -p "$OUT_DIR/frames"
-  STEP4_LOG="$OUT_DIR/frames/.step4.log"
-  "$SCRIPT_DIR/extract_frames.sh" "$VIDEO" "$OUT_DIR/frames" "$SCENE_TH" "$TICK_S" "$MAX_FRAMES" > "$STEP4_LOG" 2>&1 &
-  STEP4_PID=$!
+  # 幂等：已有 scene_*.jpg 或 tick_*.jpg → 跳过
+  if [ $FORCE -eq 0 ] && ls "$OUT_DIR/frames"/scene_*.jpg "$OUT_DIR/frames"/tick_*.jpg >/dev/null 2>&1; then
+    ok "frames/ 已存在（幂等跳过），加 --force 重跑"
+    STEP4_SKIP=1
+  else
+    STEP4_LOG="$OUT_DIR/frames/.step4.log"
+    "$SCRIPT_DIR/extract_frames.sh" "$VIDEO" "$OUT_DIR/frames" "$SCENE_TH" "$TICK_S" "$MAX_FRAMES" > "$STEP4_LOG" 2>&1 &
+    STEP4_PID=$!
+  fi
 fi
 
 # 同步跑 step 2（CPU 密集，< 5 秒完成）
+# 跳过逻辑：如果 step 3 会跳过转录（即 srt 已存在 + 非 FORCE），wav 也不需要
 if [ $RUN_STEP_2 -eq 1 ]; then
   step 2 "抽音轨"
   mkdir -p "$OUT_DIR/audio"
-  "$SCRIPT_DIR/extract_audio.sh" "$VIDEO" "$OUT_DIR/audio/full.wav"
-  ok "音轨已抽"
+  STEP3_WILL_SKIP=0
+  [ $FROM_STEP -le 3 ] && [ $TO_STEP -ge 3 ] && [ $FORCE -eq 0 ] && [ -s "$OUT_DIR/captions/full.srt" ] && STEP3_WILL_SKIP=1
+  if [ $STEP3_WILL_SKIP -eq 1 ]; then
+    ok "step 3 将跳过转录（srt 已存在），wav 不需要重抽"
+  elif [ $FORCE -eq 0 ] && [ -s "$OUT_DIR/audio/full.wav" ]; then
+    ok "音轨已存在（幂等跳过），加 --force 重跑"
+  else
+    "$SCRIPT_DIR/extract_audio.sh" "$VIDEO" "$OUT_DIR/audio/full.wav"
+    ok "音轨已抽"
+  fi
 fi
 
 # 等 step 4 后台完成
@@ -240,6 +270,8 @@ if [ -n "$STEP4_PID" ]; then
     exit $STEP4_RC
   fi
   rm -f "$STEP4_LOG"
+elif [ $STEP4_SKIP -eq 1 ]; then
+  :  # 已跳过，什么都不做
 fi
 
 # 处理 SKIP_FRAMES 警告（兼容原逻辑）
@@ -251,9 +283,14 @@ fi
 if [ $FROM_STEP -le 3 ] && [ $TO_STEP -ge 3 ]; then
   step 3 "whisper.cpp 转录"
   mkdir -p "$OUT_DIR/captions"
-  rm -f "$OUT_DIR/captions"/full.* 2>/dev/null
-  "$SCRIPT_DIR/transcribe.sh" "$OUT_DIR/audio/full.wav" "$OUT_DIR/captions" \
-    "$WHISPER_MODEL" "$PROCESSORS" "$THREADS" "zh" "$WHISPER_TIMEOUT"
+  # 幂等：captions/full.srt 已存在且非空 → 跳过（除非 --force）
+  if [ $FORCE -eq 0 ] && [ -s "$OUT_DIR/captions/full.srt" ]; then
+    ok "captions/full.srt 已存在（幂等跳过），加 --force 重跑"
+  else
+    rm -f "$OUT_DIR/captions"/full.* 2>/dev/null
+    "$SCRIPT_DIR/transcribe.sh" "$OUT_DIR/audio/full.wav" "$OUT_DIR/captions" \
+      "$WHISPER_MODEL" "$PROCESSORS" "$THREADS" "zh" "$WHISPER_TIMEOUT"
+  fi
 
   # 把 srt 转成 json 给后续步骤用（必须用 unquoted heredoc 让 bash 展开 $OUT_DIR）
   OUT_DIR_FOR_PY="$OUT_DIR" python3 << 'PY'
@@ -289,6 +326,12 @@ PY
     exit 1
   fi
   ok "转录完成"
+
+  # wav 不再需要（json/srt 是最终产物），除非用户 --keep-audio
+  if [ "${KEEP_AUDIO:-0}" -eq 0 ] && [ -f "$OUT_DIR/audio/full.wav" ]; then
+    rm -f "$OUT_DIR/audio/full.wav"
+    echo "  (已清理 $OUT_DIR/audio/full.wav，加 --keep-audio 保留)"
+  fi
 fi
 
 # ====== STEP 5: 视觉理解 ======
@@ -354,8 +397,12 @@ elif [ $SKIP_ANKI -eq 1 ]; then
 fi
 
 echo ""
+PIPELINE_END=$(date +%s)
+PIPELINE_ELAPSED=$((PIPELINE_END - PIPELINE_START))
+PIPELINE_MIN=$((PIPELINE_ELAPSED / 60))
+PIPELINE_SEC=$((PIPELINE_ELAPSED % 60))
 echo -e "${GREEN}============================================${NC}"
-echo -e "${GREEN}✅ 知识库生成完成${NC}"
+echo -e "${GREEN}✅ 知识库生成完成（总耗时 ${PIPELINE_MIN} 分 ${PIPELINE_SEC} 秒）${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo ""
 echo "📁 输出目录: $OUT_DIR"
