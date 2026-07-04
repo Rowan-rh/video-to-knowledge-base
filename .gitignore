@@ -1,0 +1,7 @@
+# Runtime artifacts (created by pipeline.sh)
+scripts/*.pyc
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
