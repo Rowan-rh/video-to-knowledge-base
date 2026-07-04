@@ -315,10 +315,10 @@ fi
 # ====== STEP 8: 推送到飞书知识库（可选） ======
 if [ $FROM_STEP -le 8 ] && [ $TO_STEP -ge 8 ] && [ $SKIP_FEISHU -eq 0 ]; then
   step 8 "推送到飞书知识库"
-  FEISHU_ARGS=""
-  [ -n "$FEISHU_SPACE" ] && FEISHU_ARGS="$FEISHU_ARGS --space-id $FEISHU_SPACE"
-  [ -n "$FEISHU_PARENT" ] && FEISHU_ARGS="$FEISHU_ARGS --parent-node-token $FEISHU_PARENT"
-  if "$SCRIPT_DIR/push_to_feishu.sh" "$OUT_DIR" $FEISHU_ARGS; then
+  FEISHU_ARGS=()
+  [ -n "$FEISHU_SPACE" ] && FEISHU_ARGS+=(--space-id "$FEISHU_SPACE")
+  [ -n "$FEISHU_PARENT" ] && FEISHU_ARGS+=(--parent-node-token "$FEISHU_PARENT")
+  if "$SCRIPT_DIR/push_to_feishu.sh" "$OUT_DIR" "${FEISHU_ARGS[@]}"; then
     ok "飞书推送完成"
   else
     FEISHU_EXIT=$?

@@ -206,6 +206,30 @@ info "4. 推送文档到飞书"
 SUCCESS=0
 FAIL=0
 SKIP=0
+ORPHAN_TOKENS=()  # 记录失败创建的孤儿节点 token，最后统一清理
+
+# 退出前尝试清理孤儿节点（防止网络中断留下空节点）
+cleanup_orphans() {
+  if [ ${#ORPHAN_TOKENS[@]} -gt 0 ]; then
+    warn "清理 ${#ORPHAN_TOKENS[@]} 个孤儿节点..."
+    for tok in "${ORPHAN_TOKENS[@]}"; do
+      lark-cli wiki +node-delete --node-token "$tok" --as user >/dev/null 2>&1 || true
+    done
+  fi
+}
+trap cleanup_orphans EXIT
+
+# 检查节点是否为空（防止重跑时跳过空节点导致永远写不进去）
+is_node_empty() {
+  local node_token="$1"
+  # 飞书 API：获取文档内容。空文档返回空字符串或极短内容
+  local content
+  content="$(lark-cli docs +get --api-version v2 --doc "$node_token" --as user 2>/dev/null || echo "")"
+  # 移除空白后判断长度（< 10 字符视为空）
+  local stripped
+  stripped="$(echo "$content" | tr -d '[:space:]')"
+  [ "${#stripped}" -lt 10 ]
+}
 
 for md_file in "${MD_FILES[@]}"; do
   fname="$(basename "$md_file" .md)"
@@ -232,25 +256,31 @@ for n in d.get('data',{}).get('nodes',[]):
     fi
   fi
 
+  # 已存在节点：检查是否为空；非空才跳过（防止孤儿节点永远写不进去）
   if [ -n "$EXISTING_CHILD" ]; then
-    warn "[$fname] 节点已存在，跳过"
-    SKIP=$((SKIP + 1))
-    continue
-  fi
+    if is_node_empty "$EXISTING_CHILD"; then
+      warn "[$fname] 节点已存在但内容为空（孤儿节点），重新写入"
+      OBJ_TOKEN="$EXISTING_CHILD"
+    else
+      warn "[$fname] 节点已存在且有内容，跳过"
+      SKIP=$((SKIP + 1))
+      continue
+    fi
+  else
+    # 创建子节点
+    CHILD_RESULT="$(lark-cli wiki +node-create \
+      --space-id "$SPACE_ID" \
+      --parent-node-token "$PARENT_NODE" \
+      --title "$node_title" \
+      --as user 2>/dev/null)"
 
-  # 创建子节点
-  CHILD_RESULT="$(lark-cli wiki +node-create \
-    --space-id "$SPACE_ID" \
-    --parent-node-token "$PARENT_NODE" \
-    --title "$node_title" \
-    --as user 2>/dev/null)"
+    OBJ_TOKEN="$(echo "$CHILD_RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('data',{}).get('obj_token',''))" 2>/dev/null || true)"
 
-  OBJ_TOKEN="$(echo "$CHILD_RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('data',{}).get('obj_token',''))" 2>/dev/null || true)"
-
-  if [ -z "$OBJ_TOKEN" ]; then
-    err "[$fname] 创建节点失败"
-    FAIL=$((FAIL + 1))
-    continue
+    if [ -z "$OBJ_TOKEN" ]; then
+      err "[$fname] 创建节点失败"
+      FAIL=$((FAIL + 1))
+      continue
+    fi
   fi
 
   # 写入 markdown 内容到节点关联文档
@@ -265,6 +295,8 @@ for n in d.get('data',{}).get('nodes',[]):
     ok "[$fname] 推送成功"
     SUCCESS=$((SUCCESS + 1))
   else
+    # 写入失败：记录 OBJ_TOKEN 用于稍后清理（孤儿节点）
+    ORPHAN_TOKENS+=("$OBJ_TOKEN")
     # 大文件可能超限，尝试截断前 2000 行
     FILE_LINES=$(wc -l < "$md_file")
     if [ "$FILE_LINES" -gt 2000 ]; then
@@ -277,17 +309,24 @@ for n in d.get('data',{}).get('nodes',[]):
         --doc-format markdown \
         --as user >/dev/null 2>&1; then
         ok "[$fname] 截断推送成功 (${FILE_LINES} → 2000 行)"
+        # 成功写入，从孤儿列表移除
+        ORPHAN_TOKENS=("${ORPHAN_TOKENS[@]/$OBJ_TOKEN/}")
         SUCCESS=$((SUCCESS + 1))
       else
-        err "[$fname] 推送失败（即使截断后）"
+        err "[$fname] 推送失败（即使截断后），将作为孤儿节点清理"
         FAIL=$((FAIL + 1))
       fi
     else
-      err "[$fname] 推送失败"
+      err "[$fname] 推送失败，将作为孤儿节点清理"
       FAIL=$((FAIL + 1))
     fi
   fi
 done
+
+# 显式禁用 EXIT trap 的清理（已经失败的就让它失败，不再清理）
+trap - EXIT
+# 主动清理孤儿节点
+cleanup_orphans
 
 echo ""
 echo "==============================================="

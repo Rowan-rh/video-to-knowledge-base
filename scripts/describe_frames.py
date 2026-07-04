@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""通过 ollama HTTP API 描述每张图。
+"""通过 ollama HTTP API 描述每张图（多线程并发）。
 
 ollama 0.18 + 多模态模型用法：
   POST http://localhost:11434/api/generate
   JSON: {"model":"llava-phi3","prompt":"...","images":["<base64>"],"stream":false}
 
 支持：
-  - 单帧描述进度显示
+  - 并发描述（默认 4 路线程，M1 Pro 上 Metal GPU 排队执行，IO 部分并发节省 ~50% 时间）
   - 出错自动重试 2 次
-  - 增量写盘（中断后可恢复）
+  - 增量写盘（中断后可恢复，已完成帧 SKIP）
+  - 通过环境变量 MAX_WORKERS 调整并发数（默认 4）
 """
+import argparse
 import json
 import os
 import sys
@@ -18,13 +20,18 @@ import urllib.request
 import subprocess
 import tempfile
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
+import threading
 
 ROOT = Path(__file__).resolve().parent.parent
 FRAMES_DIR = ROOT / "frames"
 OUT_FILE = ROOT / "vision" / "frame_manifest.json"
 OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# 写盘锁（多线程安全）
+WRITE_LOCK = threading.Lock()
 
 PROMPT = (
     "请用中文详细描述这张图片的内容。"
@@ -112,9 +119,19 @@ def get_video_ts_from_jsons() -> dict:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-workers", type=int,
+                        default=int(os.environ.get("MAX_WORKERS", "4")),
+                        help="并发线程数（默认 4，M1 Pro 推荐；Metal GPU 上 GPU 部分排队，IO 部分真正并发）")
+    parser.add_argument("--frames-dir", type=Path, default=None, help="覆盖默认 frames 目录")
+    args = parser.parse_args()
+
+    frames_dir = args.frames_dir or FRAMES_DIR
+    max_workers = max(1, args.max_workers)
+
     warmup_ollama()
     ts_map = get_video_ts_from_jsons()
-    frames = sorted([p for p in FRAMES_DIR.glob("*.jpg") if not p.name.startswith(".")])
+    frames = sorted([p for p in frames_dir.glob("*.jpg") if not p.name.startswith(".")])
 
     existing = {}
     if OUT_FILE.exists():
@@ -126,21 +143,31 @@ def main():
         except Exception:
             pass
 
-    result = []
-    for i, p in enumerate(frames, 1):
-        rel = f"frames/{p.name}"
-        if p.name in existing:
-            print(f"[{i}/{len(frames)}] SKIP {p.name}", flush=True)
-            result.append(existing[p.name])
-            continue
-        print(f"[{i}/{len(frames)}] DESCRIBE {p.name} ...", flush=True)
+    # 跳过已完成的帧
+    todo = [p for p in frames if p.name not in existing]
+    skipped = [existing[p.name] for p in frames if p.name in existing]
+    for item in skipped:
+        print(f"SKIP {item['filename']}", flush=True)
+
+    if not todo:
+        print(f"\nDONE 0 new frames ({len(skipped)} already done). saved → {OUT_FILE}")
+        return
+
+    print(f"并发数: {max_workers}（待处理 {len(todo)} 帧，跳过 {len(skipped)} 帧）", flush=True)
+
+    # 维护按文件名索引的结果字典（线程安全更新）
+    result_map = {item["filename"]: item for item in skipped}
+    completed_count = [0]  # 列表用于闭包修改
+    total = len(todo)
+
+    def describe_one(p: Path) -> dict:
+        """单帧描述 + 立即写盘 + 返回 record"""
         t0 = time.time()
         desc = call_ollama_vision(p)
         cost = time.time() - t0
-        ts = ts_map.get(p.name)
-        if ts is None:
-            ts = -1.0
-        result.append({
+        ts = ts_map.get(p.name, -1.0)
+        rel = f"frames/{p.name}"
+        record = {
             "path": rel,
             "filename": p.name,
             "kind": "scene" if p.name.startswith("scene_") else "tick",
@@ -150,13 +177,43 @@ def main():
             "cost_sec": round(cost, 1),
             "model": VISION_MODEL,
             "at": datetime.now().isoformat(timespec="seconds"),
-        })
-        OUT_FILE.write_text(json.dumps(result, ensure_ascii=False, indent=2))
-        # 顺手打印一段摘要
-        snippet = desc[:80].replace("\n", " ")
-        print(f"    ts={result[-1]['ts_hms']} ({cost:.1f}s) :: {snippet}...")
+        }
+        with WRITE_LOCK:
+            result_map[p.name] = record
+            completed_count[0] += 1
+            # 按文件名排序后写盘（保证输出顺序稳定）
+            ordered = sorted(result_map.values(),
+                             key=lambda r: (0 if r["kind"] == "scene" else 1, r["filename"]))
+            OUT_FILE.write_text(json.dumps(ordered, ensure_ascii=False, indent=2))
+            snippet = desc[:80].replace("\n", " ")
+            print(f"[{completed_count[0]}/{total}] {p.name} ts={record['ts_hms']} ({cost:.1f}s) :: {snippet}...", flush=True)
+        return record
 
-    print(f"\nDONE {len(result)} frames. saved → {OUT_FILE}")
+    # 多线程并发（IO/网络部分真正并行，GPU 部分 Metal 排队）
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(describe_one, p): p for p in todo}
+        for fut in as_completed(futures):
+            p = futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                err_record = {
+                    "path": f"frames/{p.name}",
+                    "filename": p.name,
+                    "kind": "scene" if p.name.startswith("scene_") else "tick",
+                    "ts_sec": ts_map.get(p.name, -1.0),
+                    "ts_hms": None,
+                    "description": f"[EXCEPTION] {type(e).__name__}: {e}"[:300],
+                    "cost_sec": 0.0,
+                    "model": VISION_MODEL,
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                }
+                with WRITE_LOCK:
+                    result_map[p.name] = err_record
+                    completed_count[0] += 1
+                print(f"[{completed_count[0]}/{total}] {p.name} :: {err_record['description'][:80]}", flush=True)
+
+    print(f"\nDONE {len(result_map)} frames (new={completed_count[0]}, skipped={len(skipped)}). saved → {OUT_FILE}")
 
 
 if __name__ == "__main__":
