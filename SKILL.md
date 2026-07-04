@@ -8,10 +8,16 @@ description: >
   model (QoderWork). Optionally push the knowledge base to Feishu wiki.
   Optionally generate Anki flashcards from extracted knowledge points and
   upload to local Anki via AnkiConnect.
-  Use when the user says "把这个视频转成知识库", "视频转录+笔记",
-  "做一份视频学习资料", "推送到飞书知识库", "生成 Anki 卡片",
-  or wants to ingest a lecture / meeting / tutorial video into markdown
-  notes, sync to Feishu, and create Anki flashcards.
+  Use when the user says any of:
+  - "把这个视频转成知识库" / "转录这个视频" / "视频转录+笔记"
+  - "做一份视频学习资料" / "做视频笔记" / "提取视频要点" / "视频摘要"
+  - "把视频做成 Markdown 笔记" / "Obsidian 笔记" / "思维导图"
+  - "推送到飞书知识库" / "同步到飞书 wiki" / "飞书云文档"
+  - "生成 Anki 卡片" / "Anki 闪卡" / "记忆卡片"
+  - "视频转 PPT 大纲" / "导出课程讲义" / "讲座整理"
+  - ingest a lecture / meeting / tutorial video into markdown notes,
+    sync to Feishu, or create Anki flashcards.
+  Triggers on any video file path passed as argument.
 allowed-tools: Bash Read Write Edit Glob Grep Task
 ---
 

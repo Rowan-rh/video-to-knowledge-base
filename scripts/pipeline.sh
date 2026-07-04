@@ -9,7 +9,8 @@
 #   --processors N              whisper 并行 processor 数（默认 4）
 #   --threads N                 whisper 线程数（默认 8）
 #   --frames N                  期望总帧数（自动分场景/保底）
-#   --scene-threshold F         场景切换阈值（默认 0.25）
+#   --scene-threshold F         场景切换阈值（默认 0.4）
+#   --max-frames N              抽帧总数上限（默认 200，超出按时间均匀采样）
 #   --skip-frames               跳过抽帧和视觉理解
 #   --skip-notes                跳过结构化笔记
 #   --skip-feishu               跳过推送到飞书知识库
@@ -23,7 +24,7 @@
 #   --to-step N                 到第 N 步结束（默认 9）
 #   -h, --help                  帮
 
-set -e
+set -eo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # 颜色
@@ -33,6 +34,22 @@ ok()   { echo -e "${GREEN}✓${NC} $1"; }
 warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 err()  { echo -e "${RED}✗${NC} $1"; }
 
+# run_python <tag> <cmd...> — 跑 Python 脚本，成功时 tail 末尾，失败时打印完整日志并返回非零退出码
+RUN_PY_LOGDIR=$(mktemp -d -t v2k_pylog.XXXXXX)
+trap 'rm -rf "$RUN_PY_LOGDIR"' EXIT
+run_python() {
+  local tag="$1"; shift
+  local log="$RUN_PY_LOGDIR/${tag}.log"
+  if python3 "$@" > "$log" 2>&1; then
+    tail -10 "$log"
+  else
+    local rc=$?
+    err "Python 脚本失败 (rc=$rc): $*"
+    cat "$log"
+    return $rc
+  fi
+}
+
 # 默认参数
 VIDEO=""
 OUT_DIR=""
@@ -40,7 +57,8 @@ WHISPER_MODEL="ggml-medium-q5_0"     # 默认 medium：质量+速度平衡
 PROCESSORS=4                          # whisper.cpp 并行 processor
 THREADS=8                             # whisper.cpp 线程
 FRAMES=80
-SCENE_TH=0.25
+SCENE_TH=0.4              # 0.25 对 B 站讲解类太敏感，提到 0.4
+MAX_FRAMES=200             # 总帧数上限（防止极端情况）
 SKIP_FRAMES=0
 SKIP_NOTES=0
 SKIP_FEISHU=0
@@ -50,6 +68,7 @@ SKIP_ANKI=0
 ANKI_DECK=""
 VISION_MODEL="llava-phi3"
 TEXT_MODEL="qwen3:8b"
+WHISPER_TIMEOUT=7200       # whisper 转录超时（秒），默认 2h
 FROM_STEP=1
 TO_STEP=9
 
@@ -71,6 +90,7 @@ while [[ $# -gt 0 ]]; do
     --threads) THREADS="$2"; shift 2 ;;
     --frames) FRAMES="$2"; shift 2 ;;
     --scene-threshold) SCENE_TH="$2"; shift 2 ;;
+    --max-frames) MAX_FRAMES="$2"; shift 2 ;;
     --skip-frames) SKIP_FRAMES=1; shift ;;
     --skip-notes) SKIP_NOTES=1; shift ;;
     --skip-feishu) SKIP_FEISHU=1; shift ;;
@@ -80,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     --anki-deck) ANKI_DECK="$2"; shift 2 ;;
     --vision-model) VISION_MODEL="$2"; shift 2 ;;
     --text-model) TEXT_MODEL="$2"; shift 2 ;;
+    --whisper-timeout) WHISPER_TIMEOUT="$2"; shift 2 ;;
     --from-step) FROM_STEP="$2"; shift 2 ;;
     --to-step) TO_STEP="$2"; shift 2 ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -102,6 +123,27 @@ VIDEO_DIR="$( cd "$( dirname "$VIDEO" )" && pwd )"
 VIDEO_NAME="$( basename "$VIDEO" )"
 VIDEO_STEM="${VIDEO_NAME%.*}"
 [ -z "$OUT_DIR" ] && OUT_DIR="$VIDEO_DIR/${VIDEO_STEM}-知识库"
+
+# OUT_DIR 路径规范化 + 白名单校验（防止写到系统目录/并发冲突）
+OUT_DIR="$(cd "$(dirname "$OUT_DIR")" 2>/dev/null && pwd)/$(basename "$OUT_DIR")" || { err "无法解析 OUT_DIR: $OUT_DIR"; exit 1; }
+
+# 白名单：OUT_DIR 必须在 $HOME、/tmp 或 $TMPDIR 子树下，禁止写到 /etc /var /usr 等系统目录
+ALLOWED_ROOT_OK=0
+case "$OUT_DIR/" in
+  "$HOME"/*)   ALLOWED_ROOT_OK=1 ;;
+  "/tmp"/*)    ALLOWED_ROOT_OK=1 ;;
+esac
+# $TMPDIR（macOS 通常是 /var/folders/.../T/，去掉末尾 / 避免双斜杠）
+if [ "$ALLOWED_ROOT_OK" -eq 0 ] && [ -n "${TMPDIR:-}" ]; then
+  case "$OUT_DIR/" in
+    "${TMPDIR%/}/"*) ALLOWED_ROOT_OK=1 ;;
+  esac
+fi
+if [ "$ALLOWED_ROOT_OK" -eq 0 ]; then
+  err "OUT_DIR 不在允许范围内: $OUT_DIR"
+  err "必须在 \$HOME ($HOME)、/tmp 或 \$TMPDIR (${TMPDIR:-未设置}) 子目录下"
+  exit 1
+fi
 
 # step range 验证
 if ! [[ "$FROM_STEP" =~ ^[0-9]+$ ]] || ! [[ "$TO_STEP" =~ ^[0-9]+$ ]]; then
@@ -161,12 +203,48 @@ if [ $FROM_STEP -le 1 ] && [ $TO_STEP -ge 1 ]; then
   ok "脚本已拷贝到 $OUT_DIR/scripts/"
 fi
 
-# ====== STEP 2: 抽音轨 ======
-if [ $FROM_STEP -le 2 ] && [ $TO_STEP -ge 2 ]; then
+# ====== STEP 2 & 4 并行：抽音轨（CPU）+ 抽帧（CPU+少量GPU）======
+# 抽帧不依赖音轨，可与抽音轨并行，节省 ~30 秒
+RUN_STEP_2=0
+RUN_STEP_4=0
+[ $FROM_STEP -le 2 ] && [ $TO_STEP -ge 2 ] && RUN_STEP_2=1
+[ $FROM_STEP -le 4 ] && [ $TO_STEP -ge 4 ] && [ $SKIP_FRAMES -eq 0 ] && RUN_STEP_4=1
+
+# 启动 step 4 后台（不依赖 step 2 输出）
+STEP4_PID=""
+STEP4_LOG=""
+if [ $RUN_STEP_4 -eq 1 ]; then
+  step 4 "抽关键帧（后台）"
+  mkdir -p "$OUT_DIR/frames"
+  STEP4_LOG="$OUT_DIR/frames/.step4.log"
+  "$SCRIPT_DIR/extract_frames.sh" "$VIDEO" "$OUT_DIR/frames" "$SCENE_TH" "$TICK_S" "$MAX_FRAMES" > "$STEP4_LOG" 2>&1 &
+  STEP4_PID=$!
+fi
+
+# 同步跑 step 2（CPU 密集，< 5 秒完成）
+if [ $RUN_STEP_2 -eq 1 ]; then
   step 2 "抽音轨"
   mkdir -p "$OUT_DIR/audio"
   "$SCRIPT_DIR/extract_audio.sh" "$VIDEO" "$OUT_DIR/audio/full.wav"
   ok "音轨已抽"
+fi
+
+# 等 step 4 后台完成
+if [ -n "$STEP4_PID" ]; then
+  wait "$STEP4_PID" && STEP4_RC=0 || STEP4_RC=$?
+  if [ $STEP4_RC -eq 0 ]; then
+    ok "抽帧完成"
+  else
+    err "step 4 抽帧失败 (rc=$STEP4_RC)"
+    [ -n "$STEP4_LOG" ] && tail -20 "$STEP4_LOG"
+    exit $STEP4_RC
+  fi
+  rm -f "$STEP4_LOG"
+fi
+
+# 处理 SKIP_FRAMES 警告（兼容原逻辑）
+if [ $SKIP_FRAMES -eq 1 ] && [ $FROM_STEP -le 4 ] && [ $TO_STEP -ge 4 ]; then
+  warn "跳过抽帧（--skip-frames）"
 fi
 
 # ====== STEP 3: 转录 ======
@@ -175,7 +253,7 @@ if [ $FROM_STEP -le 3 ] && [ $TO_STEP -ge 3 ]; then
   mkdir -p "$OUT_DIR/captions"
   rm -f "$OUT_DIR/captions"/full.* 2>/dev/null
   "$SCRIPT_DIR/transcribe.sh" "$OUT_DIR/audio/full.wav" "$OUT_DIR/captions" \
-    "$WHISPER_MODEL" "$PROCESSORS" "$THREADS" "zh"
+    "$WHISPER_MODEL" "$PROCESSORS" "$THREADS" "zh" "$WHISPER_TIMEOUT"
 
   # 把 srt 转成 json 给后续步骤用（必须用 unquoted heredoc 让 bash 展开 $OUT_DIR）
   OUT_DIR_FOR_PY="$OUT_DIR" python3 << 'PY'
@@ -199,36 +277,38 @@ if srt.exists():
     )
     print(f"  → JSON 含 {len(segs)} 段")
 PY
-  ok "转录完成"
-fi
 
-# ====== STEP 4: 抽帧 ======
-if [ $FROM_STEP -le 4 ] && [ $TO_STEP -ge 4 ] && [ $SKIP_FRAMES -eq 0 ]; then
-  step 4 "抽关键帧"
-  "$SCRIPT_DIR/extract_frames.sh" "$VIDEO" "$OUT_DIR/frames" "$SCENE_TH" "$TICK_S"
-  ok "抽帧完成"
-elif [ $SKIP_FRAMES -eq 1 ]; then
-  warn "跳过抽帧（--skip-frames）"
+  # SRT 存在性 + 非空检查（防止 whisper 失败导致后面步骤基于空字幕跑出空白笔记）
+  if [ ! -s "$OUT_DIR/captions/full.srt" ]; then
+    err "转录产物缺失或为空：$OUT_DIR/captions/full.srt"
+    err "可能原因：whisper-cli 失败、视频无声、视频超 2.5h、模型未下载"
+    exit 1
+  fi
+  if [ ! -s "$OUT_DIR/captions/full.json" ]; then
+    err "SRT→JSON 转换失败：$OUT_DIR/captions/full.json 未生成"
+    exit 1
+  fi
+  ok "转录完成"
 fi
 
 # ====== STEP 5: 视觉理解 ======
 if [ $FROM_STEP -le 5 ] && [ $TO_STEP -ge 5 ] && [ $SKIP_FRAMES -eq 0 ]; then
   step 5 "视觉理解（$VISION_MODEL）"
-  VISION_MODEL="$VISION_MODEL" python3 "$OUT_DIR/scripts/describe_frames.py" 2>&1 | tail -10
+  VISION_MODEL="$VISION_MODEL" run_python describe_frames "$OUT_DIR/scripts/describe_frames.py"
   ok "视觉理解完成"
 fi
 
 # ====== STEP 6: 结构化笔记 ======
 if [ $FROM_STEP -le 6 ] && [ $TO_STEP -ge 6 ] && [ $SKIP_NOTES -eq 0 ]; then
   step 6 "结构化笔记（$TEXT_MODEL）"
-  TEXT_MODEL="$TEXT_MODEL" python3 "$OUT_DIR/scripts/compose_notes.py" 2>&1 | tail -10
+  TEXT_MODEL="$TEXT_MODEL" run_python compose_notes "$OUT_DIR/scripts/compose_notes.py"
   ok "笔记完成"
 fi
 
 # ====== STEP 7: 整合 + 帧索引 ======
 if [ $FROM_STEP -le 7 ] && [ $TO_STEP -ge 7 ]; then
   step 7 "帧索引 + 整合"
-  python3 "$OUT_DIR/scripts/index_frames.py" 2>&1 | tail -3
+  run_python index_frames "$OUT_DIR/scripts/index_frames.py"
   ok "全部完成"
 fi
 

@@ -1,11 +1,12 @@
 #!/bin/bash
 # extract_frames.sh — 抽关键帧（场景切换 + 间隔保底），时间戳嵌入文件名
-# 用法：./extract_frames.sh <video> <frames_dir> [scene_threshold=0.25] [tick_seconds=90]
+# 用法：./extract_frames.sh <video> <frames_dir> [scene_threshold=0.4] [tick_seconds=90] [max_frames=200]
 set -e
 VIDEO="$1"
 OUT_DIR="$2"
-SCENE_TH="${3:-0.25}"
+SCENE_TH="${3:-0.4}"     # 0.25 对 B 站讲解类太敏感（PPT 切换太多），提到 0.4 更稳健
 TICK_S="${4:-90}"
+MAX_FRAMES="${5:-200}"   # 总帧数上限（防止极端场景切太多，导致后续视觉理解爆炸）
 
 if [ -z "$VIDEO" ] || [ -z "$OUT_DIR" ]; then
   echo "用法：$0 <video.mp4> <frames_dir> [scene_threshold=0.25] [tick_seconds=90]" >&2
@@ -18,6 +19,7 @@ echo "=== 场景切换抽帧（阈值 $SCENE_TH）==="
 ffmpeg -hide_banner -loglevel info -y \
   -i "$VIDEO" -vf "select='gt(scene,$SCENE_TH)'" \
   -vsync vfr -frame_pts true -q:v 3 \
+  -frames:v "$MAX_FRAMES" \
   "$OUT_DIR/scene_%015d.000000.jpg" \
   2> "$OUT_DIR/.scene_showinfo.log"
 SCENE_COUNT=$(ls "$OUT_DIR"/scene_*.jpg 2>/dev/null | wc -l | tr -d ' ')
@@ -76,4 +78,28 @@ PY
 
 echo ""
 TOTAL=$(ls "$OUT_DIR"/*.jpg 2>/dev/null | wc -l | tr -d ' ')
+
+# 总帧数超 MAX_FRAMES 时按时间均匀采样保留（极端情况下同时控制 tick + scene 总数）
+if [ "$TOTAL" -gt "$MAX_FRAMES" ]; then
+  # 用 Python 按文件名前缀的时间戳排序后均匀采样
+  OUT_DIR_FOR_PY="$OUT_DIR" MAX_FRAMES_FOR_PY="$MAX_FRAMES" python3 << 'PY'
+import os
+from pathlib import Path
+out = Path(os.environ["OUT_DIR_FOR_PY"])
+max_n = int(os.environ["MAX_FRAMES_FOR_PY"])
+all_files = sorted([p for p in out.glob("*.jpg") if not p.name.startswith(".")])
+if len(all_files) > max_n:
+    step = len(all_files) / max_n
+    keep_idx = {int(i * step) for i in range(max_n)}
+    keep = {all_files[i] for i in keep_idx}
+    removed = 0
+    for f in all_files:
+        if f not in keep:
+            f.unlink()
+            removed += 1
+    print(f"  → 总帧数 {len(all_files)} > {max_n}，按时间均匀采样保留 {len(keep)} 张（删除 {removed} 张）")
+PY
+  TOTAL=$(ls "$OUT_DIR"/*.jpg 2>/dev/null | wc -l | tr -d ' ')
+fi
+
 echo "✓ 抽帧完成：$TOTAL 张 jpg (大小 $(du -sh $OUT_DIR | awk '{print $1}'))"

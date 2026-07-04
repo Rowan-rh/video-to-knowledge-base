@@ -167,7 +167,9 @@ if [ -n "$WHISPER_MODEL" ]; then
   fi
 else
   err "whisper 模型未下载（需要至少一个：medium/large/small）"
-  MISSING+=("mkdir -p $WHISPER_CACHE && curl -L -o $WHISPER_CACHE/ggml-medium-q5_0.bin 'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin'")
+  # 拆成两个简单命令（不用复合命令，便于安全校验）
+  MISSING+=("mkdir -p $WHISPER_CACHE")
+  MISSING+=("curl -L -o $WHISPER_CACHE/ggml-medium-q5_0.bin 'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin'")
 fi
 
 echo ""
@@ -452,22 +454,44 @@ if [ $FIX -eq 1 ] && [ ${#MISSING[@]} -gt 0 ]; then
   echo ""
   echo "尝试自动修复..."
   for cmd in "${MISSING[@]}"; do
+    # 安全校验：拒绝任何含 shell 特殊字符的命令（防止命令注入）
+    if echo "$cmd" | grep -qE '[;&|`$()<>{}]'; then
+      err "命令含 shell 特殊字符，跳过: $cmd"
+      continue
+    fi
     case "$cmd" in
-      "brew install"*)
-        echo "  跑: $cmd"
-        eval "$cmd" || true
+      "brew install "*)
+        pkg="${cmd#brew install }"
+        echo "  跑: brew install $pkg"
+        brew install "$pkg" || true
         ;;
-      "ollama pull"*)
-        echo "  跑: $cmd"
-        eval "$cmd" || true
+      "brew install")  # 无参数 fallback
+        echo "  跑: brew install"
+        brew install || true
         ;;
-      "curl"*)
-        echo "  跑: $cmd"
-        eval "$cmd" || true
+      "ollama pull "*)
+        model="${cmd#ollama pull }"
+        echo "  跑: ollama pull $model"
+        ollama pull "$model" || true
         ;;
-      "python -m pip install"*)
-        echo "  跑: $cmd"
-        eval "$cmd" || true
+      "python -m pip install "*)
+        mod="${cmd#python -m pip install }"
+        echo "  跑: python -m pip install $mod"
+        python3 -m pip install "$mod" || true
+        ;;
+      "/bin/bash -c"*)
+        # Homebrew 安装命令（特殊允许，但拆出 URL）
+        err "Homebrew 安装需手动执行: $cmd"
+        ;;
+      mkdir*curl*)
+        # 复合命令 mkdir X && curl ...  → 拆分执行
+        mkdir_part="${cmd%%&&*}"
+        curl_part="${cmd#*&& }"
+        mkdir_part="${mkdir_part#mkdir }"
+        curl_part="${curl_part#curl }"
+        mkdir_dir="${mkdir_part%% *}"
+        echo "  跑: mkdir -p $mkdir_dir && curl $curl_part"
+        mkdir -p "$mkdir_dir" && curl $curl_part || true
         ;;
       *)
         echo "  跳过自动安装: $cmd"
